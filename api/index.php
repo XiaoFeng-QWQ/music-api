@@ -1,10 +1,11 @@
 <?php
+error_reporting(0);
 // 设置API路径
-define('API_URI', api_uri());
+define('API_URI', getpageurl());
 // 设置中文歌词
 define('TLYRIC', true);
 // 设置歌单文件缓存及时间
-define('CACHE', false);
+define('CACHE', true);
 define('CACHE_TIME', 86400);
 // 设置短期缓存-需要安装apcu
 define('APCU_CACHE', false);
@@ -13,124 +14,146 @@ define('AUTH', false);
 define('AUTH_SECRET', 'meting-secret');
 
 if (!isset($_GET['type']) || !isset($_GET['id'])) {
-    include __DIR__ . '/public/index.php';
+    include __DIR__ . '/docs/index.php';
     exit;
 }
 
-$server = isset($_GET['server']) ? $_GET['server'] : 'netease';
+$server = 'netease';
 $type = $_GET['type'];
 $id = $_GET['id'];
 
-if (AUTH) {
-    $auth = isset($_GET['auth']) ? $_GET['auth'] : '';
-    if (in_array($type, ['url', 'pic', 'lrc'])) {
-        if ($auth == '' || $auth != auth($server . $type . $id)) {
-            http_response_code(403);
-            exit;
-        }
-    }
+if (AUTH && !validate_auth($type, $server, $id)) {
+    http_response_code(403);
+    exit;
 }
 
-// 数据格式
-if (in_array($type, ['song', 'playlist'])) {
-    header('content-type: application/json; charset=utf-8;');
-} else if (in_array($type, ['name', 'lrc', 'artist'])) {
-    header('content-type: text/plain; charset=utf-8;');
-}
-
-// 允许跨站
+set_content_type($type);
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET');
 
-include __DIR__ . '/vendor/autoload.php';
+include __DIR__ . '/src/Meting.php';
 
 use Metowolf\Meting;
 
 $api = new Meting($server);
 $api->format(true);
 
-if ($type == 'playlist') {
+if ($type === 'playlist') {
+    handle_playlist_request($api, $server, $id);
+} else {
+    handle_other_requests($api, $type, $id, $server);
+}
 
-    if (CACHE) {
-        $file_path = __DIR__ . '/cache/playlist/' . $server . '_' . $id . '.json';
-        if (file_exists($file_path)) {
-            if ($_SERVER['REQUEST_TIME'] - filectime($file_path) < CACHE_TIME) {
-                echo file_get_contents($file_path);
-                exit;
-            }
-        }
+// 生成API URI
+function getpageurl()
+{
+    $pageURL = 'http';
+    if (isset($_SERVER['HTTPS']) && $_SERVER["HTTPS"] == "on") {
+        $pageURL .= "s";
+    }
+    $pageURL .= "://";
+    if ($_SERVER["SERVER_PORT"] != "80") {
+        $pageURL .= $_SERVER["SERVER_NAME"] . ":" . $_SERVER["SERVER_PORT"] . $_SERVER["REQUEST_URI"];
+    } else {
+        $pageURL .= $_SERVER["SERVER_NAME"] . $_SERVER["REQUEST_URI"];
+    }
+    return $pageURL;
+}
+
+// 验证auth
+function validate_auth($type, $server, $id)
+{
+    if (in_array($type, ['url', 'pic', 'lrc'])) {
+        $auth = $_GET['auth'] ?? '';
+        return $auth && $auth === auth($server . $type . $id);
+    }
+    return true;
+}
+
+// 设置内容类型
+function set_content_type($type)
+{
+    $content_type = 'application/json; charset=utf-8';
+    if (in_array($type, ['name', 'lrc', 'artist'])) {
+        $content_type = 'text/plain; charset=utf-8';
+    }
+    header("Content-Type: $content_type");
+}
+
+// 处理歌单请求
+function handle_playlist_request($api, $server, $id)
+{
+    $file_path = __DIR__ . "/cache/playlist/{$server}_{$id}.json";
+
+    if (CACHE && file_exists($file_path) && $_SERVER['REQUEST_TIME'] - filectime($file_path) < CACHE_TIME) {
+        echo file_get_contents($file_path);
+        exit;
     }
 
     $data = $api->playlist($id);
-    if ($data == '[]') {
+    if ($data === '[]') {
         echo '{"error":"unknown playlist id"}';
         exit;
     }
-    $data = json_decode($data);
-    $playlist = array();
-    foreach ($data as $song) {
-        $playlist[] = array(
-            'name'   => $song->name,
-            'artist' => implode('/', $song->artist),
-            'url'    => API_URI . '?server=' . $song->source . '&type=url&id=' . $song->url_id . (AUTH ? '&auth=' . auth($song->source . 'url' . $song->url_id) : ''),
-            'pic'    => API_URI . '?server=' . $song->source . '&type=pic&id=' . $song->pic_id . (AUTH ? '&auth=' . auth($song->source . 'pic' . $song->pic_id) : ''),
-            'lrc'    => API_URI . '?server=' . $song->source . '&type=lrc&id=' . $song->lyric_id . (AUTH ? '&auth=' . auth($song->source . 'lrc' . $song->lyric_id) : '')
-        );
-    }
-    $playlist = json_encode($playlist);
 
+    $playlist = build_playlist_data(json_decode($data));
     if (CACHE) {
-        // ! mkdir /cache/playlist
         file_put_contents($file_path, $playlist);
     }
-
     echo $playlist;
-} else {
-    $need_song = !in_array($type, ['url', 'pic', 'lrc']);
-    if ($need_song && !in_array($type, ['name', 'artist', 'song'])) {
-        echo '{"error":"unknown type"}';
-        exit;
+}
+
+// 构建歌单数据
+function build_playlist_data($data)
+{
+    $playlist = [];
+    foreach ($data as $song) {
+        $playlist[] = [
+            'name'   => $song->name,
+            'artist' => implode('/', $song->artist),
+            'url'    => build_api_url($song->source, 'url', $song->url_id),
+            'pic'    => build_api_url($song->source, 'pic', $song->pic_id),
+            'lrc'    => build_api_url($song->source, 'lrc', $song->lyric_id)
+        ];
+    }
+    return json_encode($playlist);
+}
+
+// 构造API URL
+function build_api_url($source, $type, $id)
+{
+    return API_URI . "?server=$source&type=$type&id=$id" . (AUTH ? '&auth=' . auth($source . $type . $id) : '');
+}
+
+// 处理其他请求
+function handle_other_requests($api, $type, $id, $server)
+{
+    $apcu_key = "{$server}{$type}{$id}";
+    if (APCU_CACHE && apcu_exists($apcu_key)) {
+        return_data($type, apcu_fetch($apcu_key));
     }
 
+    $data = get_request_data($api, $type, $id, $server);
     if (APCU_CACHE) {
-        $apcu_time = $type == 'url' ? 600 : 36000;
-        $apcu_type_key = $server . $type . $id;
-        if (apcu_exists($apcu_type_key)) {
-            $data = apcu_fetch($apcu_type_key);
-            return_data($type, $data);
-        }
-        if ($need_song) {
-            $apcu_song_id_key = $server . 'song_id' . $id;
-            if (apcu_exists($apcu_song_id_key)) {
-                $song = apcu_fetch($apcu_song_id_key);
-            }
-        }
+        apcu_store($apcu_key, $data, $type === 'url' ? 600 : 36000);
     }
-
-    if (!$need_song) {
-        $data = song2data($api, null, $type, $id);
-    } else {
-        if (!isset($song)) $song = $api->song($id);
-        if ($song == '[]') {
-            echo '{"error":"unknown song"}';
-            exit;
-        }
-        if (APCU_CACHE) {
-            apcu_store($apcu_song_id_key, $song, $apcu_time);
-        }
-        $data = song2data($api, json_decode($song)[0], $type, $id);
-    }
-
-    if (APCU_CACHE) {
-        apcu_store($apcu_type_key, $data, $apcu_time);
-    }
-
     return_data($type, $data);
 }
 
-function api_uri() // static
+// 根据请求类型获取数据
+function get_request_data($api, $type, $id)
 {
-    return 'https://' . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?');
+    if (in_array($type, ['url', 'pic', 'lrc'])) {
+        return song2data($api, null, $type, $id);
+    }
+
+    $song = json_decode($api->song($id))[0] ?? null;
+    if (!$song) {
+        echo '{"error":"unknown song"}';
+        exit;
+    }
+
+    return song2data($api, $song, $type, $id);
 }
 
 function auth($name)
@@ -140,82 +163,75 @@ function auth($name)
 
 function song2data($api, $song, $type, $id)
 {
-    $data = '';
     switch ($type) {
         case 'name':
-            $data = $song->name;
-            break;
-
+            return $song->name;
         case 'artist':
-            $data = implode('/', $song->artist);
-            break;
-
+            return implode('/', $song->artist);
         case 'url':
-            $m_url = json_decode($api->url($id, 320))->url;
-            if ($m_url == '') break;
-            // url
-            if ($api->server == 'netease') {
-                if ($m_url[4] != 's') $m_url = str_replace('http', 'https', $m_url);
-            }
-
-            $data = $m_url;
-            break;
-
+            return get_formatted_url($api->url($id, 320));
         case 'pic':
-            $data = json_decode($api->pic($id, 90))->url;
-            break;
-
+            return json_decode($api->pic($id, 90))->url;
         case 'lrc':
-            $lrc_data = json_decode($api->lyric($id));
-            if ($lrc_data->lyric == '') {
-                $lrc = '[00:00.00]这似乎是一首纯音乐呢，请尽情欣赏它吧！';
-            } else if ($lrc_data->tlyric == '') {
-                $lrc = $lrc_data->lyric;
-            } else if (TLYRIC) { // lyric_cn
-                $lrc_arr = explode("\n", $lrc_data->lyric);
-                $lrc_cn_arr = explode("\n", $lrc_data->tlyric);
-                $lrc_cn_map = array();
-                foreach ($lrc_cn_arr as $i => $v) {
-                    if ($v == '') continue;
-                    $line = explode(']', $v, 2);
-                    // 格式化处理
-                    $line[1] = trim(preg_replace('/\s\s+/', ' ', $line[1]));
-                    $lrc_cn_map[$line[0]] = $line[1];
-                    unset($lrc_cn_arr[$i]);
-                }
-                foreach ($lrc_arr as $i => $v) {
-                    if ($v == '') continue;
-                    $key = explode(']', $v, 2)[0];
-                    if (!empty($lrc_cn_map[$key]) && $lrc_cn_map[$key] != '//') {
-                        $lrc_arr[$i] .= ' (' . $lrc_cn_map[$key] . ')';
-                        unset($lrc_cn_map[$key]);
-                    }
-                }
-                $lrc = implode("\n", $lrc_arr);
-            } else {
-                $lrc = $lrc_data->lyric;
-            }
-            $data = $lrc;
-            break;
-
+            return get_lyrics_data($api, $id);
         case 'song':
-            $data = json_encode(array(array(
-                'name'   => $song->name,
-                'artist' => implode('/', $song->artist),
-                'url'    => API_URI . '?server=' . $song->source . '&type=url&id=' . $song->url_id . (AUTH ? '&auth=' . auth($song->source . 'url' . $song->url_id) : ''),
-                'pic'    => API_URI . '?server=' . $song->source . '&type=pic&id=' . $song->pic_id . (AUTH ? '&auth=' . auth($song->source . 'pic' . $song->pic_id) : ''),
-                'lrc'    => API_URI . '?server=' . $song->source . '&type=lrc&id=' . $song->lyric_id . (AUTH ? '&auth=' . auth($song->source . 'lrc' . $song->lyric_id) : '')
-            )));
-            break;
+            return build_song_data($song);
     }
-    if ($data == '') exit;
-    return $data;
+    exit;
+}
+
+function get_formatted_url($url_data)
+{
+    $url = json_decode($url_data)->url;
+    return $url && $url[4] !== 's' ? str_replace('http', 'https', $url) : $url;
+}
+
+function get_lyrics_data($api, $id)
+{
+    $lyrics = json_decode($api->lyric($id));
+    if (empty($lyrics->lyric)) {
+        return '[00:00.00]这似乎是一首纯音乐呢，请尽情欣赏它吧！';
+    }
+    return TLYRIC && !empty($lyrics->tlyric) ? merge_lyrics($lyrics) : $lyrics->lyric;
+}
+
+function merge_lyrics($lyrics)
+{
+    $lrc_arr = explode("\n", $lyrics->lyric);
+    $lrc_cn_arr = explode("\n", $lyrics->tlyric);
+    $lrc_cn_map = array();
+
+    foreach ($lrc_cn_arr as $line) {
+        if (empty($line)) continue;
+        [$key, $value] = explode(']', $line, 2);
+        $lrc_cn_map[trim($key)] = trim(preg_replace('/\s\s+/', ' ', $value));
+    }
+
+    foreach ($lrc_arr as &$line) {
+        $key = explode(']', $line, 2)[0];
+        if (isset($lrc_cn_map[$key])) {
+            $line .= ' (' . $lrc_cn_map[$key] . ')';
+        }
+    }
+
+    return implode("\n", $lrc_arr);
+}
+
+function build_song_data($song)
+{
+    return json_encode([[
+        'name'   => $song->name,
+        'artist' => implode('/', $song->artist),
+        'url'    => build_api_url($song->source, 'url', $song->url_id),
+        'pic'    => build_api_url($song->source, 'pic', $song->pic_id),
+        'lrc'    => build_api_url($song->source, 'lrc', $song->lyric_id)
+    ]]);
 }
 
 function return_data($type, $data)
 {
     if (in_array($type, ['url', 'pic'])) {
-        header('Location: ' . $data);
+        header("Location: $data");
     } else {
         echo $data;
     }
